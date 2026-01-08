@@ -4,3 +4,4 @@ pandas
 numpy
 plotly
 python-dotenv
+streamlit-autorefresh
