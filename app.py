@@ -1,13 +1,12 @@
-import time
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from streamlit_autorefresh import st_autorefresh
 
 from dhan_client import NIFTY, SENSEX, fetch_chain_for_symbol
 from analytics import flatten_chain, atm_strike, pcr, oi_walls, buildup_summary
 
 st.set_page_config(page_title="Live Option Chain Analyzer", layout="wide")
-
 st.title("📈 Live Option Chain Analyzer (DhanHQ)")
 
 with st.sidebar:
@@ -19,6 +18,10 @@ with st.sidebar:
     auto = st.toggle("Auto refresh", value=True)
     st.caption("Dhan option chain is rate-limited; keep refresh ≥ 3s.")
 
+# ✅ IMPORTANT: rerun the whole script safely (NO while loop)
+if auto:
+    st_autorefresh(interval=refresh * 1000, key="auto_refresh")
+
 symbol_obj = NIFTY if symbol == NIFTY["name"] else SENSEX
 
 @st.cache_data(ttl=3, show_spinner=False)
@@ -27,8 +30,6 @@ def load_data(sym):
     df, spot = flatten_chain(oc)
     meta = oc.get("_meta", {})
     return df, spot, meta
-
-placeholder = st.empty()
 
 def render():
     df, spot, meta = load_data(symbol_obj)
@@ -41,7 +42,6 @@ def render():
     col3.metric("Nearest Expiry", expiry)
     col4.metric("PCR (OI)", f"{pcr(df):.2f}" if pd.notna(pcr(df)) else "-")
 
-    # Bias
     summary = buildup_summary(df, spot, band=band)
     bcol1, bcol2, bcol3 = st.columns([1, 1, 2])
     bcol1.metric("Bias", summary["bias"])
@@ -54,10 +54,8 @@ def render():
 
     st.divider()
 
-    # Charts
     left, right = st.columns(2)
 
-    # OI walls chart
     chart_df = df.copy()
     chart_df["distance"] = chart_df["strike"] - spot
     chart_df = chart_df[(chart_df["distance"] >= -band) & (chart_df["distance"] <= band)]
@@ -68,46 +66,39 @@ def render():
         var_name="side",
         value_name="oi",
     )
-    fig_oi = px.bar(oi_plot, x="strike", y="oi", color="side", barmode="group",
-                    title=f"OI around ATM (±{band}) | ATM≈{atm}")
-    left.plotly_chart(fig_oi, use_container_width=True)
+    fig_oi = px.bar(
+        oi_plot, x="strike", y="oi", color="side", barmode="group",
+        title=f"OI around ATM (±{band}) | ATM≈{atm}"
+    )
+    left.plotly_chart(fig_oi, use_container_width=True, key=f"oi_chart_{symbol}")
 
-    # ΔOI chart
     doi_plot = chart_df.melt(
         id_vars=["strike"],
         value_vars=["ce_oi_chg", "pe_oi_chg"],
         var_name="side",
         value_name="oi_change",
     )
-    fig_doi = px.bar(doi_plot, x="strike", y="oi_change", color="side", barmode="group",
-                     title="Change in OI (ΔOI) around ATM")
-    right.plotly_chart(fig_doi, use_container_width=True)
+    fig_doi = px.bar(
+        doi_plot, x="strike", y="oi_change", color="side", barmode="group",
+        title="Change in OI (ΔOI) around ATM"
+    )
+    right.plotly_chart(fig_doi, use_container_width=True, key=f"doi_chart_{symbol}")
 
     st.divider()
 
-    # Support/Resistance tables
     walls = oi_walls(df, spot, top_n=top_n)
     t1, t2, t3, t4 = st.columns(4)
     t1.subheader("🟢 Support (Put OI)")
-    t1.dataframe(walls["support_by_oi"], use_container_width=True, hide_index=True)
+    t1.dataframe(walls["support_by_oi"], use_container_width=True, hide_index=True, key=f"s_oi_{symbol}")
     t2.subheader("🔴 Resistance (Call OI)")
-    t2.dataframe(walls["resistance_by_oi"], use_container_width=True, hide_index=True)
+    t2.dataframe(walls["resistance_by_oi"], use_container_width=True, hide_index=True, key=f"r_oi_{symbol}")
     t3.subheader("🟢 Support (Put ΔOI)")
-    t3.dataframe(walls["support_by_oi_change"], use_container_width=True, hide_index=True)
+    t3.dataframe(walls["support_by_oi_change"], use_container_width=True, hide_index=True, key=f"s_doi_{symbol}")
     t4.subheader("🔴 Resistance (Call ΔOI)")
-    t4.dataframe(walls["resistance_by_oi_change"], use_container_width=True, hide_index=True)
+    t4.dataframe(walls["resistance_by_oi_change"], use_container_width=True, hide_index=True, key=f"r_doi_{symbol}")
 
     st.divider()
-
-    # Full chain viewer
     st.subheader("Option Chain (flattened)")
-    st.dataframe(df, use_container_width=True, height=420)
+    st.dataframe(df, use_container_width=True, height=420, key=f"chain_{symbol}")
 
-with placeholder.container():
-    render()
-
-if auto:
-    while True:
-        time.sleep(refresh)
-        with placeholder.container():
-            render()
+render()
