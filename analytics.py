@@ -1,150 +1,180 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 
 
-def flatten_chain(oc_resp: Dict[str, Any]) -> Tuple[pd.DataFrame, float]:
+@dataclass
+class Zone:
+    side: str                 # "support" or "resistance"
+    lo: float
+    hi: float
+    center: float
+    score: float
+    strikes: List[float]
+
+
+def _robust_z(x: pd.Series) -> pd.Series:
+    """Robust scaling: (x - median) / IQR. Safer than standard z for heavy tails."""
+    x = pd.to_numeric(x, errors="coerce")
+    med = x.median(skipna=True)
+    q1 = x.quantile(0.25)
+    q3 = x.quantile(0.75)
+    iqr = (q3 - q1) if pd.notna(q3) and pd.notna(q1) and (q3 - q1) != 0 else np.nan
+    if pd.isna(iqr):
+        return (x - med).fillna(0.0)
+    return ((x - med) / iqr).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _make_zones(strikes_scores: pd.DataFrame, step: float, max_gap_steps: int = 1) -> List[Zone]:
     """
-    Returns:
-      df: one row per strike with CE/PE fields
-      spot: underlying last_price
+    Group adjacent strikes into zones. max_gap_steps=1 means cluster strikes within <= 1*step gap.
+    Expects columns: strike, score, side
     """
-    data = oc_resp.get("data", {})
-    spot = float(data.get("last_price", np.nan))
-    oc = data.get("oc", {}) or {}
+    strikes_scores = strikes_scores.sort_values("strike").reset_index(drop=True)
+    zones: List[Zone] = []
+    if strikes_scores.empty:
+        return zones
 
-    rows: List[Dict[str, Any]] = []
-    for strike_str, sides in oc.items():
-        try:
-            strike = float(strike_str)
-        except Exception:
-            continue
+    current = [float(strikes_scores.loc[0, "strike"])]
+    current_scores = [float(strikes_scores.loc[0, "score"])]
+    side = str(strikes_scores.loc[0, "side"])
 
-        ce = (sides or {}).get("ce") or {}
-        pe = (sides or {}).get("pe") or {}
+    for i in range(1, len(strikes_scores)):
+        s = float(strikes_scores.loc[i, "strike"])
+        sc = float(strikes_scores.loc[i, "score"])
+        prev = current[-1]
 
-        def g(side: Dict[str, Any], k: str):
-            return side.get(k)
+        if (s - prev) <= (max_gap_steps * step):
+            current.append(s)
+            current_scores.append(sc)
+        else:
+            lo, hi = min(current), max(current)
+            center = float(np.average(current, weights=np.maximum(current_scores, 1e-6)))
+            zones.append(Zone(side=side, lo=lo, hi=hi, center=center,
+                              score=float(np.sum(current_scores)), strikes=current.copy()))
+            current = [s]
+            current_scores = [sc]
 
-        def gr(side: Dict[str, Any], k: str):
-            return (side.get("greeks") or {}).get(k)
-
-        rows.append({
-            "strike": strike,
-
-            "ce_ltp": g(ce, "last_price"),
-            "ce_oi": g(ce, "oi"),
-            "ce_oi_chg": g(ce, "oi_change"),
-            "ce_vol": g(ce, "volume"),
-            "ce_iv": g(ce, "implied_volatility"),
-            "ce_delta": gr(ce, "delta"),
-            "ce_gamma": gr(ce, "gamma"),
-            "ce_theta": gr(ce, "theta"),
-            "ce_vega": gr(ce, "vega"),
-
-            "pe_ltp": g(pe, "last_price"),
-            "pe_oi": g(pe, "oi"),
-            "pe_oi_chg": g(pe, "oi_change"),
-            "pe_vol": g(pe, "volume"),
-            "pe_iv": g(pe, "implied_volatility"),
-            "pe_delta": gr(pe, "delta"),
-            "pe_gamma": gr(pe, "gamma"),
-            "pe_theta": gr(pe, "theta"),
-            "pe_vega": gr(pe, "vega"),
-        })
-
-    df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
-
-    # numeric cleanup
-    for c in df.columns:
-        if c != "strike":
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    return df, spot
+    lo, hi = min(current), max(current)
+    center = float(np.average(current, weights=np.maximum(current_scores, 1e-6)))
+    zones.append(Zone(side=side, lo=lo, hi=hi, center=center,
+                      score=float(np.sum(current_scores)), strikes=current.copy()))
+    return zones
 
 
-def atm_strike(spot: float, step: int = 50) -> float:
-    if np.isnan(spot):
-        return np.nan
-    return round(spot / step) * step
+def infer_step(df: pd.DataFrame, fallback: float = 50) -> float:
+    diffs = np.diff(np.sort(df["strike"].dropna().unique()))
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return fallback
+    return float(pd.Series(diffs).mode().iloc[0])
 
 
-def pcr(df: pd.DataFrame) -> float:
-    pe = df["pe_oi"].sum(skipna=True)
-    ce = df["ce_oi"].sum(skipna=True)
-    return float(pe / ce) if ce and ce != 0 else np.nan
-
-
-def oi_walls(df: pd.DataFrame, spot: float, top_n: int = 5) -> Dict[str, pd.DataFrame]:
+def support_resistance_zones(
+    df: pd.DataFrame,
+    spot: float,
+    band: float = 800,
+    top_k: int = 1,
+    max_gap_steps: int = 1,
+    weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, Zone]:
     """
-    Support: strongest Put OI (and/or ΔOI) below spot
-    Resistance: strongest Call OI (and/or ΔOI) above spot
+    Returns best support + best resistance zone.
     """
-    below = df[df["strike"] <= spot].copy()
-    above = df[df["strike"] >= spot].copy()
+    if weights is None:
+        weights = {
+            "oi": 1.0,
+            "oi_chg": 1.2,
+            "vol": 0.6,
+            "iv": 0.2,
+        }
 
-    support_oi = below.nlargest(top_n, "pe_oi")[["strike", "pe_oi", "pe_oi_chg", "pe_iv", "pe_ltp"]]
-    resist_oi = above.nlargest(top_n, "ce_oi")[["strike", "ce_oi", "ce_oi_chg", "ce_iv", "ce_ltp"]]
-
-    support_chg = below.nlargest(top_n, "pe_oi_chg")[["strike", "pe_oi", "pe_oi_chg", "pe_iv", "pe_ltp"]]
-    resist_chg = above.nlargest(top_n, "ce_oi_chg")[["strike", "ce_oi", "ce_oi_chg", "ce_iv", "ce_ltp"]]
-
-    return {
-        "support_by_oi": support_oi,
-        "resistance_by_oi": resist_oi,
-        "support_by_oi_change": support_chg,
-        "resistance_by_oi_change": resist_chg,
-    }
-
-
-def buildup_summary(df: pd.DataFrame, spot: float, band: float = 500) -> Dict[str, Any]:
-    """
-    Simple “buildup” heuristic around ATM:
-    - net ΔOI (puts - calls)
-    - volume imbalance
-    - IV skew near ATM
-    """
-    if np.isnan(spot):
-        return {"score": np.nan, "bias": "Unknown"}
+    step = infer_step(df, fallback=50)
 
     win = df[(df["strike"] >= spot - band) & (df["strike"] <= spot + band)].copy()
     if win.empty:
-        return {"score": np.nan, "bias": "Unknown"}
+        return {}
 
-    put_chg = win["pe_oi_chg"].sum(skipna=True)
-    call_chg = win["ce_oi_chg"].sum(skipna=True)
-    net_chg = put_chg - call_chg
+    # Build support candidates (puts, below spot)
+    sup = win[win["strike"] <= spot].copy()
+    res = win[win["strike"] >= spot].copy()
 
-    put_vol = win["pe_vol"].sum(skipna=True)
-    call_vol = win["ce_vol"].sum(skipna=True)
-    net_vol = put_vol - call_vol
+    # If oi_change is missing/None from API, it becomes NaN. Treat as 0.
+    for c in ["pe_oi", "pe_oi_chg", "pe_vol", "pe_iv", "ce_oi", "ce_oi_chg", "ce_vol", "ce_iv"]:
+        if c in sup.columns:
+            win[c] = pd.to_numeric(win[c], errors="coerce")
+            sup[c] = pd.to_numeric(sup.get(c), errors="coerce")
+            res[c] = pd.to_numeric(res.get(c), errors="coerce")
 
-    # crude IV skew: average put IV - call IV
-    put_iv = win["pe_iv"].mean(skipna=True)
-    call_iv = win["ce_iv"].mean(skipna=True)
-    iv_skew = (put_iv - call_iv) if (pd.notna(put_iv) and pd.notna(call_iv)) else np.nan
+    sup["pe_oi_chg"] = sup["pe_oi_chg"].fillna(0)
+    res["ce_oi_chg"] = res["ce_oi_chg"].fillna(0)
 
-    # Score: weighted combination
-    score = 0.0
-    score += np.tanh(net_chg / 200000) * 2.0   # tune divisor by typical OI scale
-    score += np.tanh(net_vol / 200000) * 1.0
-    if pd.notna(iv_skew):
-        score += np.tanh(iv_skew / 5.0) * 1.0  # skew in vol pts
+    # Robust-normalize within window
+    z_pe_oi = _robust_z(win["pe_oi"])
+    z_pe_chg = _robust_z(win["pe_oi_chg"])
+    z_pe_vol = _robust_z(win["pe_vol"])
+    z_pe_iv = _robust_z(win["pe_iv"])
 
-    # Interpret score
-    if score >= 1.0:
-        bias = "Bullish"
-    elif score <= -1.0:
-        bias = "Bearish"
-    else:
-        bias = "Sideways / Mixed"
+    z_ce_oi = _robust_z(win["ce_oi"])
+    z_ce_chg = _robust_z(win["ce_oi_chg"])
+    z_ce_vol = _robust_z(win["ce_vol"])
+    z_ce_iv = _robust_z(win["ce_iv"])
 
-    return {
-        "score": float(score),
-        "bias": bias,
-        "net_oi_change_put_minus_call": float(net_chg),
-        "net_volume_put_minus_call": float(net_vol),
-        "iv_skew_put_minus_call": float(iv_skew) if pd.notna(iv_skew) else np.nan,
-    }
+    # Map back to sup/res by index alignment
+    win = win.reset_index(drop=True)
+    sup = sup.reset_index(drop=True)
+    res = res.reset_index(drop=True)
+
+    # Rebuild sup/res with the normalized columns by merging on strike (safe)
+    zmap = win[["strike"]].copy()
+    zmap["z_pe_oi"] = z_pe_oi.values
+    zmap["z_pe_chg"] = z_pe_chg.values
+    zmap["z_pe_vol"] = z_pe_vol.values
+    zmap["z_pe_iv"] = z_pe_iv.values
+    zmap["z_ce_oi"] = z_ce_oi.values
+    zmap["z_ce_chg"] = z_ce_chg.values
+    zmap["z_ce_vol"] = z_ce_vol.values
+    zmap["z_ce_iv"] = z_ce_iv.values
+
+    sup = sup.merge(zmap, on="strike", how="left")
+    res = res.merge(zmap, on="strike", how="left")
+
+    # Strike-level scores
+    sup["score"] = (
+        weights["oi"] * sup["z_pe_oi"]
+        + weights["oi_chg"] * sup["z_pe_chg"]
+        + weights["vol"] * sup["z_pe_vol"]
+        + weights["iv"] * sup["z_pe_iv"]
+    )
+    res["score"] = (
+        weights["oi"] * res["z_ce_oi"]
+        + weights["oi_chg"] * res["z_ce_chg"]
+        + weights["vol"] * res["z_ce_vol"]
+        + weights["iv"] * res["z_ce_iv"]
+    )
+
+    # Keep only positive contributions (ignore weak strikes)
+    sup_scores = sup[["strike", "score"]].copy()
+    res_scores = res[["strike", "score"]].copy()
+    sup_scores = sup_scores[sup_scores["score"] > 0].sort_values("score", ascending=False)
+    res_scores = res_scores[res_scores["score"] > 0].sort_values("score", ascending=False)
+
+    # Take a handful of top strikes before clustering
+    sup_scores = sup_scores.head(12).assign(side="support")
+    res_scores = res_scores.head(12).assign(side="resistance")
+
+    sup_zones = _make_zones(sup_scores, step=step, max_gap_steps=max_gap_steps)
+    res_zones = _make_zones(res_scores, step=step, max_gap_steps=max_gap_steps)
+
+    sup_best = sorted(sup_zones, key=lambda z: z.score, reverse=True)[:top_k]
+    res_best = sorted(res_zones, key=lambda z: z.score, reverse=True)[:top_k]
+
+    out = {}
+    if sup_best:
+        out["support"] = sup_best[0]
+    if res_best:
+        out["resistance"] = res_best[0]
+    return out
