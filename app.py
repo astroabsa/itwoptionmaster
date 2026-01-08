@@ -2,200 +2,157 @@ import streamlit as st
 import pandas as pd
 from dhanhq import dhanhq
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ==========================================
-# 1. PAGE CONFIGURATION
+# 1. SETUP
 # ==========================================
-st.set_page_config(
-    page_title="Dhan Option Chain Analyzer",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="Dhan Diagnostic Tool", page_icon="🛠️", layout="wide")
 
 st.markdown("""
 <style>
-    .metric-card { background-color: #0e1117; border: 1px solid #262730; border-radius: 5px; padding: 15px; text-align: center; }
-    .bullish { color: #00FF00; font-weight: bold; }
-    .bearish { color: #FF0000; font-weight: bold; }
+    .success-box { padding: 10px; background-color: #d4edda; color: #155724; border-radius: 5px; border: 1px solid #c3e6cb; }
+    .error-box { padding: 10px; background-color: #f8d7da; color: #721c24; border-radius: 5px; border: 1px solid #f5c6cb; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. CONFIGURATION & MAPS
+# 2. DIAGNOSTIC FUNCTIONS
 # ==========================================
 
-# Verified IDs for Dhan
-INDEX_MAP = {
-    'NIFTY':     {'id': '13', 'name': 'NIFTY 50', 'default_spot': 26000}, 
-    'BANKNIFTY': {'id': '25', 'name': 'BANK NIFTY', 'default_spot': 54000}, 
-    'SENSEX':    {'id': '51', 'name': 'SENSEX',     'default_spot': 84000}
-}
-
-# ==========================================
-# 3. HELPER FUNCTIONS
-# ==========================================
-
-@st.cache_data(ttl=300) # Cache expiry list for 5 mins
-def fetch_expiry_dates(client_id, access_token, security_id):
+def test_connection(client_id, access_token, segment, security_id, expiry_date):
     """
-    Fetches the list of ACTIVE expiry dates from Dhan.
-    This prevents 'Invalid Request' errors by ensuring we only ask for valid dates.
+    Tries to fetch data with a specific combination of parameters.
+    Returns (Success_Bool, Message/Data)
     """
     try:
         dhan = dhanhq(client_id, access_token)
-        # Use IDX_I for Index Underlying
-        response = dhan.expiry_list(
+        # Test 1: Option Chain Fetch
+        response = dhan.option_chain(
+            under_exchange_segment=segment,
             under_security_id=security_id,
-            under_exchange_segment="IDX_I" 
+            expiry=str(expiry_date)
         )
         if response['status'] == 'success':
-            return response['data'] # Returns list of date strings ['2026-01-13', ...]
+            return True, response['data']
         else:
-            st.error(f"Expiry Fetch Error: {response}")
-            return []
+            return False, response # Return error dict
     except Exception as e:
-        st.error(f"Connection Error: {e}")
-        return []
+        return False, str(e)
 
-@st.cache_data(ttl=15)
-def fetch_option_chain(client_id, access_token, security_id, expiry_str):
-    """Fetches Option Chain for a SPECIFIC verified date."""
-    try:
-        dhan = dhanhq(client_id, access_token)
-        response = dhan.option_chain(
-            under_exchange_segment="IDX_I", 
-            under_security_id=security_id,            
-            expiry=expiry_str
-        )
-        return response
-    except Exception as e:
-        return {"status": "failure", "remarks": {"error_message": str(e)}}
-
-def process_data(df, spot):
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty: return None
+def process_data(data, spot_price):
+    """Simple processor for the data."""
+    if not data: return None
+    # Handle v2 nested structure
+    chain_list = data.get('oc', data)
+    if isinstance(chain_list, dict) and 'data' in chain_list:
+        chain_list = chain_list['data']
+    
+    df = pd.DataFrame(chain_list)
     df.columns = [c.lower() for c in df.columns]
     
-    required = ['option_type', 'strike_price', 'oi', 'last_price']
-    if not all(col in df.columns for col in required): return None
-
+    if 'option_type' not in df.columns: return None
+    
     ce = df[df['option_type'] == 'CALL'].copy()
     pe = df[df['option_type'] == 'PUT'].copy()
-    
     chain = pd.merge(ce, pe, on='strike_price', suffixes=('_ce', '_pe'))
     chain = chain.sort_values('strike_price')
     
-    # Filter Strikes around ATM
-    atm_idx = (chain['strike_price'] - spot).abs().idxmin()
-    start = max(0, atm_idx - 8)
-    end = min(len(chain), atm_idx + 9)
-    
-    return chain.iloc[start:end], chain
+    # Filter ATM
+    atm_idx = (chain['strike_price'] - spot_price).abs().idxmin()
+    return chain.iloc[max(0, atm_idx-8):min(len(chain), atm_idx+9)]
 
 # ==========================================
-# 4. SIDEBAR & LOGIC
+# 3. MAIN APP
 # ==========================================
 
+# Secrets Load
 try:
     CLIENT_ID = st.secrets["dhan"]["client_id"]
     ACCESS_TOKEN = st.secrets["dhan"]["access_token"]
 except:
-    st.error("❌ Secrets not found. Please check `.streamlit/secrets.toml`")
+    st.error("❌ Secrets not found.")
     st.stop()
 
-st.sidebar.header("⚙️ Settings")
-selected_index = st.sidebar.radio("Select Index", list(INDEX_MAP.keys()))
+st.title("🛠️ Dhan API Auto-Diagnostics")
+st.write("This tool will test multiple connection methods to find the one that works for your account.")
 
-idx_config = INDEX_MAP[selected_index]
-security_id = idx_config['id']
+c1, c2, c3 = st.columns(3)
+with c1:
+    idx_name = st.selectbox("Index", ["NIFTY", "SENSEX", "BANKNIFTY"])
+with c2:
+    # Manual date picker to ensure we match the screenshot exactly
+    # Defaulting to the date seen in your screenshot: Jan 13, 2026
+    default_date = datetime(2026, 1, 13)
+    expiry_input = st.date_input("Expiry Date (Match your Dhan App)", default_date)
+with c3:
+    run_test = st.button("🚀 Run Connection Test", type="primary")
 
-# --- STEP 1: FETCH AVAILABLE EXPIRIES ---
-# This eliminates the guessing game.
-available_expiries = fetch_expiry_dates(CLIENT_ID, ACCESS_TOKEN, security_id)
+# Configuration Map
+config = {
+    "NIFTY": {"id": "13", "spot": 26000},
+    "SENSEX": {"id": "51", "spot": 84000},
+    "BANKNIFTY": {"id": "25", "spot": 54000}
+}
+current_config = config[idx_name]
 
-if available_expiries:
-    # Default to the nearest date (first in the list)
-    selected_expiry = st.sidebar.selectbox("Select Expiry Date", available_expiries)
-else:
-    st.sidebar.warning("Could not fetch expiry list. Check connectivity.")
-    selected_expiry = None
+if run_test:
+    st.divider()
+    st.subheader(f"Testing Connectivity for {idx_name} on {expiry_input}")
+    
+    # SEGMENTS TO TEST
+    # We suspect IDX_I is standard, but NSE/NSE_FNO might be required for your specific setup
+    segments_to_test = ["IDX_I", "NSE", "NSE_FNO", "BSE"]
+    
+    success_found = False
+    valid_data = None
+    working_segment = None
 
-# Spot Price Placeholder
-if 'last_spot' not in st.session_state:
-    st.session_state['last_spot'] = idx_config['default_spot']
-
-if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
-
-# ==========================================
-# 5. DASHBOARD
-# ==========================================
-st.title(f"📊 {idx_config['name']} Analysis")
-
-if selected_expiry:
-    # --- STEP 2: FETCH OPTION CHAIN ---
-    resp = fetch_option_chain(CLIENT_ID, ACCESS_TOKEN, security_id, selected_expiry)
-
-    if isinstance(resp, dict) and resp.get('status') == 'success':
-        data = resp.get('data', {})
-        
-        # 1. Extract Spot Price (Auto-Update)
-        api_spot = data.get('last_price')
-        if api_spot:
-            st.session_state['last_spot'] = api_spot
-            st.sidebar.success(f"🟢 Live Spot: {api_spot}")
-        
-        # 2. Convert to DataFrame
-        # Handle nested 'data' structure if present (common in v2)
-        chain_data = data.get('oc', data) 
-        if isinstance(chain_data, dict) and 'data' in chain_data:
-            chain_data = chain_data['data']
+    # --- THE LOOP ---
+    for seg in segments_to_test:
+        with st.status(f"Testing Segment: **{seg}**...", expanded=False) as status:
+            is_ok, result = test_connection(CLIENT_ID, ACCESS_TOKEN, seg, current_config['id'], expiry_input)
             
-        full_df = pd.DataFrame(chain_data) if isinstance(chain_data, list) else pd.DataFrame(chain_data)
-
-        # 3. Process
-        view_df, processed_chain = process_data(full_df, st.session_state['last_spot'])
+            if is_ok:
+                status.update(label=f"✅ Segment **{seg}** : SUCCESS!", state="complete")
+                st.markdown(f"<div class='success-box'><b>Success!</b> The API accepted segment <code>{seg}</code>.</div>", unsafe_allow_html=True)
+                success_found = True
+                working_segment = seg
+                valid_data = result
+                break # Stop testing if one works
+            else:
+                status.update(label=f"❌ Segment **{seg}** : FAILED ({result.get('data', {}).get('data', 'Unknown Error')})", state="error")
+    
+    # --- RESULT DISPLAY ---
+    st.divider()
+    if success_found and valid_data:
+        st.success(f"🎉 Connection Established using Segment: {working_segment}")
         
-        if view_df is not None:
-            # KPI Calculations
-            ce_oi = processed_chain['oi_ce'].sum()
-            pe_oi = processed_chain['oi_pe'].sum()
-            pcr = round(pe_oi / ce_oi, 2) if ce_oi > 0 else 0
+        # Extract Spot
+        api_spot = valid_data.get('last_price', current_config['spot'])
+        st.metric("Live Spot Price", api_spot)
+        
+        # Show Data
+        df_view = process_data(valid_data, api_spot)
+        if df_view is not None:
+            st.write("### Option Chain Data Preview")
+            st.dataframe(df_view[['oi_ce', 'last_price_ce', 'strike_price', 'last_price_pe', 'oi_pe']], hide_index=True)
             
-            sup = processed_chain.loc[processed_chain['oi_pe'].idxmax(), 'strike_price']
-            res = processed_chain.loc[processed_chain['oi_ce'].idxmax(), 'strike_price']
-            
-            sent = "BULLISH" if pcr > 1.2 else ("BEARISH" if pcr < 0.6 else "NEUTRAL")
-            col = "bullish" if pcr > 1.2 else ("bearish" if pcr < 0.6 else "neutral")
-
-            # Metrics Row
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("PCR", pcr)
-            c2.metric("Support", sup)
-            c3.metric("Resistance", res)
-            c4.markdown(f"**Sentiment**<br><span class='{col}'>{sent}</span>", unsafe_allow_html=True)
-
-            st.divider()
-
-            # Chart Row
+            # Simple Chart
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=view_df['strike_price'], y=view_df['oi_ce'], name='Call OI', marker_color='#ff4b4b'))
-            fig.add_trace(go.Bar(x=view_df['strike_price'], y=view_df['oi_pe'], name='Put OI', marker_color='#00cc96'))
-            fig.add_vline(x=st.session_state['last_spot'], line_dash="dash", line_color="yellow", annotation_text="Spot")
-            fig.update_layout(xaxis_title="Strike", yaxis_title="Open Interest", barmode='group', height=500)
+            fig.add_trace(go.Bar(x=df_view['strike_price'], y=df_view['oi_ce'], name='Call OI', marker_color='red'))
+            fig.add_trace(go.Bar(x=df_view['strike_price'], y=df_view['oi_pe'], name='Put OI', marker_color='green'))
             st.plotly_chart(fig, use_container_width=True)
-            
-            # Table Row
-            cols = ['oi_ce', 'last_price_ce', 'strike_price', 'last_price_pe', 'oi_pe']
-            safe_cols = [c for c in cols if c in view_df.columns]
-            st.dataframe(view_df[safe_cols], hide_index=True, use_container_width=True)
         else:
-            st.error("Data received but columns missing. API response structure might have changed.")
-
-    elif isinstance(resp, dict):
-        st.error(f"⚠️ API Error: {resp.get('remarks', resp)}")
-        st.info(f"Requested: {selected_index} ({security_id}) for {selected_expiry}")
-
-else:
-    st.info("👈 Waiting for Expiry Date selection...")
+            st.warning("Connection succeeded, but data processing failed. (Check dataframe columns)")
+            
+    else:
+        st.error("❌ All connection attempts failed.")
+        st.write("### Troubleshooting Steps:")
+        st.markdown(f"""
+        1. **Check Expiry Date:** You selected **{expiry_input}**.
+           - Open your Dhan App. Does NIFTY expire on this *exact* date?
+           - If it is a holiday, the date might be Jan 12 or 14.
+        2. **Check ID:** We used ID `{current_config['id']}`.
+           - This is the standard ID. If Dhan changed IDs for 2026, you may need to check their Scrip Master CSV.
+        """)
