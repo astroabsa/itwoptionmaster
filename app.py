@@ -5,9 +5,13 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. SETUP
+# 1. PAGE CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Dhan Option Chain (2026 Rules)", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="Dhan Option Chain Analyzer",
+    page_icon="📈",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
@@ -18,28 +22,72 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. INTELLIGENT HELPERS
+# 2. CONFIGURATION & MAPS
 # ==========================================
 
-def get_next_expiry(target_weekday):
-    """
-    Finds the next date for a specific weekday.
-    0=Mon, 1=Tue (NIFTY), 2=Wed, 3=Thu (SENSEX), 4=Fri, 5=Sat, 6=Sun
-    """
+# MAPPING: Now includes 'quote_segment' for fetching Spot Price
+INDEX_MAP = {
+    'NIFTY': {
+        'id': '13', 
+        'name': 'NIFTY 50', 
+        'quote_segment': 'NSE' # Segment for Spot Price
+    }, 
+    'BANKNIFTY': {
+        'id': '25', 
+        'name': 'BANK NIFTY', 
+        'quote_segment': 'NSE'
+    }, 
+    'SENSEX': {
+        'id': '51', 
+        'name': 'SENSEX',     
+        'quote_segment': 'BSE'
+    }
+}
+
+EXPIRY_DAYS = {
+    'NIFTY': 1,      # Tuesday
+    'BANKNIFTY': 2,  # Wednesday
+    'SENSEX': 3      # Thursday
+}
+
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
+
+def get_next_expiry(index_name):
+    """Auto-calculates the correct expiry date."""
+    target_weekday = EXPIRY_DAYS.get(index_name, 3) 
     today = datetime.now().date()
     days_ahead = target_weekday - today.weekday()
-    if days_ahead <= 0: 
-        days_ahead += 7
+    if days_ahead <= 0: days_ahead += 7
     return today + timedelta(days=days_ahead)
 
-@st.cache_data(ttl=60)
-def fetch_dhan_data(client_id, access_token, under_segment, under_id, expiry_str):
+@st.cache_data(ttl=5) # Cache spot price for 5 seconds only
+def fetch_live_spot(client_id, access_token, segment, security_id):
+    """Fetches the LIVE spot price of the index."""
     try:
         dhan = dhanhq(client_id, access_token)
-        # CRITICAL FIX: Using 'IDX_I' for Indices + New Parameter Names
+        # Note: We use the QUOTE segment (NSE/BSE), not IDX_I
+        response = dhan.quote(
+            exchange_segment=segment, 
+            security_id=security_id
+        )
+        if response['status'] == 'success':
+            return float(response['data']['last_price'])
+        else:
+            return None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=60)
+def fetch_option_chain(client_id, access_token, security_id, expiry_str):
+    """Fetches Option Chain."""
+    try:
+        dhan = dhanhq(client_id, access_token)
+        # Note: We use IDX_I for the Option Chain underlying
         response = dhan.option_chain(
-            under_exchange_segment=under_segment, 
-            under_security_id=under_id,            
+            under_exchange_segment="IDX_I", 
+            under_security_id=security_id,            
             expiry=expiry_str
         )
         if response['status'] == 'success':
@@ -51,21 +99,16 @@ def fetch_dhan_data(client_id, access_token, under_segment, under_id, expiry_str
 
 def process_data(df, spot):
     if df is None or not isinstance(df, pd.DataFrame) or df.empty: return None
-    
-    # Normalize columns (handle case sensitivity)
     df.columns = [c.lower() for c in df.columns]
-    
-    # Ensure critical columns exist
     if 'option_type' not in df.columns: return None
 
     ce = df[df['option_type'] == 'CALL'].copy()
     pe = df[df['option_type'] == 'PUT'].copy()
     
-    # Merge on Strike
     chain = pd.merge(ce, pe, on='strike_price', suffixes=('_ce', '_pe'))
     chain = chain.sort_values('strike_price')
     
-    # Filter 8 Strikes around ATM
+    # Filter Strikes around ATM
     atm_idx = (chain['strike_price'] - spot).abs().idxmin()
     start = max(0, atm_idx - 8)
     end = min(len(chain), atm_idx + 9)
@@ -73,48 +116,51 @@ def process_data(df, spot):
     return chain.iloc[start:end], chain
 
 # ==========================================
-# 3. SIDEBAR & CONFIG
+# 4. SIDEBAR & LOGIC
 # ==========================================
 
 try:
     CLIENT_ID = st.secrets["dhan"]["client_id"]
     ACCESS_TOKEN = st.secrets["dhan"]["access_token"]
 except:
-    st.error("❌ Secrets not found. Check `.streamlit/secrets.toml`")
+    st.error("❌ Secrets not found.")
     st.stop()
 
-st.sidebar.header("⚙️ Configuration")
-index_choice = st.sidebar.radio("Select Index", ["NIFTY 50", "SENSEX"])
+st.sidebar.header("⚙️ Settings")
+selected_index = st.sidebar.radio("Select Index", list(INDEX_MAP.keys()))
 
-# --- 2026 REGULATORY CONFIGURATION ---
-# Effective Sep 2025: Nifty = TUESDAY, Sensex = THURSDAY
-if index_choice == "NIFTY 50":
-    sec_id = "13"
-    segment = "IDX_I"  # Indices are ALWAYS 'IDX_I'
-    spot_default = 25900 # Based on your screenshot
-    target_day = 1 # Tuesday
-elif index_choice == "SENSEX":
-    sec_id = "51"
-    segment = "IDX_I" # Indices are ALWAYS 'IDX_I'
-    spot_default = 84000
-    target_day = 3 # Thursday
+# Config
+idx_config = INDEX_MAP[selected_index]
+security_id = idx_config['id']
+quote_segment = idx_config['quote_segment']
 
-# Auto-calculate the correct date
-suggested_date = get_next_expiry(target_day)
-expiry = st.sidebar.date_input(f"Expiry ({suggested_date.strftime('%A')})", suggested_date)
+# 1. Fetch Live Spot Price (Dynamic)
+live_price = fetch_live_spot(CLIENT_ID, ACCESS_TOKEN, quote_segment, security_id)
 
-if st.sidebar.button("🔄 Refresh Data"):
+if live_price:
+    st.sidebar.success(f"🟢 Live Spot: {live_price}")
+    # Allow override but default to live price
+    spot = st.sidebar.number_input("Spot Price", value=live_price)
+else:
+    st.sidebar.warning("⚠️ Could not fetch live price")
+    spot = st.sidebar.number_input("Spot Price (Manual)", value=25000.0)
+
+# 2. Set Date
+auto_date = get_next_expiry(selected_index)
+expiry = st.sidebar.date_input(f"Expiry", auto_date)
+
+if st.sidebar.button("Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
 # ==========================================
-# 4. DASHBOARD
+# 5. DASHBOARD
 # ==========================================
-st.title(f"📊 {index_choice} Analyzer")
+st.title(f"📊 {idx_config['name']} Analysis")
+st.caption(f"Spot Price: {spot} | Expiry: {expiry}")
 
-spot = st.sidebar.number_input("Spot Price", value=spot_default)
-
-data_resp = fetch_dhan_data(CLIENT_ID, ACCESS_TOKEN, segment, sec_id, str(expiry))
+# Fetch Option Chain
+data_resp = fetch_option_chain(CLIENT_ID, ACCESS_TOKEN, security_id, str(expiry))
 
 if isinstance(data_resp, pd.DataFrame):
     view_df, full_df = process_data(data_resp, spot)
@@ -128,7 +174,6 @@ if isinstance(data_resp, pd.DataFrame):
         sup = full_df.loc[full_df['oi_pe'].idxmax(), 'strike_price']
         res = full_df.loc[full_df['oi_ce'].idxmax(), 'strike_price']
         
-        # Simple Sentiment Logic
         sent = "BULLISH" if pcr > 1.2 else ("BEARISH" if pcr < 0.6 else "NEUTRAL")
         col = "bullish" if pcr > 1.2 else ("bearish" if pcr < 0.6 else "neutral")
 
@@ -142,7 +187,6 @@ if isinstance(data_resp, pd.DataFrame):
         st.divider()
 
         # Chart
-        st.subheader("OI Structure")
         fig = go.Figure()
         fig.add_trace(go.Bar(x=view_df['strike_price'], y=view_df['oi_ce'], name='Call OI', marker_color='#ff4b4b'))
         fig.add_trace(go.Bar(x=view_df['strike_price'], y=view_df['oi_pe'], name='Put OI', marker_color='#00cc96'))
@@ -151,19 +195,12 @@ if isinstance(data_resp, pd.DataFrame):
         st.plotly_chart(fig, use_container_width=True)
         
         # Table
-        st.write("### Data Table")
-        # Ensure columns exist before display
         cols = ['oi_ce', 'last_price_ce', 'strike_price', 'last_price_pe', 'oi_pe']
         safe_cols = [c for c in cols if c in view_df.columns]
-        st.dataframe(view_df[safe_cols], hide_index=True)
+        st.dataframe(view_df[safe_cols], hide_index=True, use_container_width=True)
 
     else:
-        st.error("Data fetched but processing failed. Structure might be unexpected.")
+        st.error("Data fetched but processing failed. (Check market hours)")
 
 elif isinstance(data_resp, dict):
-    st.error(f"⚠️ **API Error:** {data_resp.get('error', 'Unknown')}")
-    st.info(f"""
-    **Why am I seeing Error 814?**
-    1. **Date:** For Nifty, ensure the date is a **Tuesday** (e.g., Jan 13, 2026).
-    2. **Segment:** The code now correctly uses `IDX_I`. If it still fails, the date is the likely culprit.
-    """)
+    st.error(f"API Error: {data_resp.get('error')}")
