@@ -18,26 +18,33 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. VERIFIED CONFIGURATION (FROM CSV)
+# 2. VERIFIED CONFIGURATION (FROM YOUR CSV)
 # ==========================================
+# These IDs come directly from your 'api-scrip-master (1).csv' file
 INDEX_MAP = {
     'NIFTY': {
-        'id': '13',           # Verified from Scrip Master
+        'id': '13',           # Verified: CSV Row for 'NIFTY'
         'segment': 'IDX_I',   # Standard Index Segment
         'name': 'NIFTY 50',
         'default_spot': 26000
     },
     'SENSEX': {
-        'id': '51',           # Verified (Old ID 51005 was wrong)
+        'id': '51',           # Verified: CSV Row for 'SENSEX' (NOT 51005)
         'segment': 'IDX_I',
         'name': 'SENSEX',
         'default_spot': 84000
     },
     'BANKNIFTY': {
-        'id': '25',           # Verified
+        'id': '25',           # Verified: CSV Row for 'BANKNIFTY'
         'segment': 'IDX_I',
         'name': 'BANK NIFTY',
         'default_spot': 54000
+    },
+    'FINNIFTY': {
+        'id': '27',           # Verified: CSV Row for 'FINNIFTY'
+        'segment': 'IDX_I',
+        'name': 'FINNIFTY',
+        'default_spot': 24000
     }
 }
 
@@ -68,7 +75,6 @@ def process_data(df, spot):
     
     # Nested data handling (v2 API structure)
     if 'oc' in df.columns: 
-        # Sometimes data is inside a key, though usually flattened by DataFrame
         pass 
 
     if 'option_type' not in df.columns: return None
@@ -94,14 +100,14 @@ try:
     CLIENT_ID = st.secrets["dhan"]["client_id"]
     ACCESS_TOKEN = st.secrets["dhan"]["access_token"]
 except:
-    st.error("❌ Secrets not found.")
+    st.error("❌ Secrets not found. Create `.streamlit/secrets.toml` with [dhan] section.")
     st.stop()
 
 st.sidebar.header("⚙️ Configuration")
 idx_name = st.sidebar.radio("Select Index", list(INDEX_MAP.keys()))
 idx_config = INDEX_MAP[idx_name]
 
-# Date Picker (Defaulting to next likely expiry)
+# Date Picker 
 today = datetime.now().date()
 expiry = st.sidebar.date_input("Expiry Date", today)
 
@@ -118,8 +124,6 @@ data_resp = fetch_option_chain(CLIENT_ID, ACCESS_TOKEN, idx_config['id'], str(ex
 if isinstance(data_resp, pd.DataFrame):
     # Extract Spot Price from the API response itself
     if 'last_price' in data_resp.columns:
-        # It's often in the 'data' root, but dataframe might repeat it or have it in a separate structure
-        # We take the first non-null value if possible, or use default
         api_spot = data_resp['last_price'].iloc[0] if not data_resp.empty else idx_config['default_spot']
     else:
         api_spot = idx_config['default_spot']
