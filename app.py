@@ -1,167 +1,113 @@
-import requests
+import time
 import pandas as pd
-import toml
-import json
+import streamlit as st
+import plotly.express as px
 
-class DhanOptionAnalyzer:
-    def __init__(self, secrets_file="secrets.toml"):
-        # 1. Load Credentials
-        try:
-            secrets = toml.load(secrets_file)
-            self.client_id = secrets["dhan"]["client_id"]
-            self.access_token = secrets["dhan"]["access_token"]
-        except Exception as e:
-            raise Exception(f"Error loading secrets.toml: {e}")
+from dhan_client import NIFTY, SENSEX, fetch_chain_for_symbol
+from analytics import flatten_chain, atm_strike, pcr, oi_walls, buildup_summary
 
-        self.base_url = "https://api.dhan.co/v2/optionchain"
-        
-    def fetch_option_chain(self, underlying_scrip=13, underlying_seg="IDX_I", expiry="2024-10-31"):
-        """
-        Fetches option chain data using the exact raw API request structure provided.
-        """
-        headers = {
-            'access-token': self.access_token,
-            'client-id': self.client_id,
-            'Content-Type': 'application/json'
-        }
-        
-        payload = {
-            "UnderlyingScrip": underlying_scrip,
-            "UnderlyingSeg": underlying_seg,
-            "Expiry": expiry
-        }
+st.set_page_config(page_title="Live Option Chain Analyzer", layout="wide")
 
-        try:
-            response = requests.post(self.base_url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"API Request Failed: {e}")
-            return None
+st.title("📈 Live Option Chain Analyzer (DhanHQ)")
 
-    def process_data(self, raw_data):
-        """
-        Converts the nested JSON response into a specialized DataFrame for analysis.
-        """
-        if not raw_data or 'data' not in raw_data or 'oc' not in raw_data['data']:
-            print("Invalid Data Format Received")
-            return None, None
+with st.sidebar:
+    st.header("Controls")
+    symbol = st.selectbox("Index", [NIFTY["name"], SENSEX["name"]], index=0)
+    refresh = st.slider("Refresh interval (seconds)", 3, 30, 5, step=1)
+    band = st.slider("ATM analysis band (points)", 200, 1500, 500, step=50)
+    top_n = st.slider("Top support/resistance levels", 3, 10, 5, step=1)
+    auto = st.toggle("Auto refresh", value=True)
+    st.caption("Dhan option chain is rate-limited; keep refresh ≥ 3s.")
 
-        spot_price = raw_data['data'].get('last_price', 0)
-        oc_data = raw_data['data']['oc']
-        
-        processed_rows = []
+symbol_obj = NIFTY if symbol == NIFTY["name"] else SENSEX
 
-        for strike_str, details in oc_data.items():
-            strike_price = float(strike_str)
-            
-            # Extract Call (CE) Data
-            ce = details.get('ce', {})
-            ce_oi = ce.get('oi', 0)
-            ce_ltp = ce.get('last_price', 0)
-            ce_vol = ce.get('volume', 0)
-            ce_iv = ce.get('implied_volatility', 0)
-            ce_delta = ce.get('greeks', {}).get('delta', 0)
-            # Calculate Change in OI (Current - Previous)
-            ce_oi_change = ce_oi - ce.get('previous_oi', 0)
+@st.cache_data(ttl=3, show_spinner=False)
+def load_data(sym):
+    oc = fetch_chain_for_symbol(sym)
+    df, spot = flatten_chain(oc)
+    meta = oc.get("_meta", {})
+    return df, spot, meta
 
-            # Extract Put (PE) Data
-            pe = details.get('pe', {})
-            pe_oi = pe.get('oi', 0)
-            pe_ltp = pe.get('last_price', 0)
-            pe_vol = pe.get('volume', 0)
-            pe_iv = pe.get('implied_volatility', 0)
-            pe_delta = pe.get('greeks', {}).get('delta', 0)
-            pe_oi_change = pe_oi - pe.get('previous_oi', 0)
+placeholder = st.empty()
 
-            processed_rows.append({
-                'strike_price': strike_price,
-                'ce_oi': ce_oi, 'ce_oi_change': ce_oi_change, 'ce_ltp': ce_ltp, 'ce_iv': ce_iv, 'ce_delta': ce_delta,
-                'pe_oi': pe_oi, 'pe_oi_change': pe_oi_change, 'pe_ltp': pe_ltp, 'pe_iv': pe_iv, 'pe_delta': pe_delta
-            })
+def render():
+    df, spot, meta = load_data(symbol_obj)
+    expiry = meta.get("expiry", "-")
+    atm = atm_strike(spot, step=50 if symbol == "NIFTY" else 100)
 
-        df = pd.DataFrame(processed_rows)
-        return df.sort_values('strike_price'), spot_price
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Index", meta.get("symbol", symbol))
+    col2.metric("Spot", f"{spot:.2f}" if pd.notna(spot) else "-")
+    col3.metric("Nearest Expiry", expiry)
+    col4.metric("PCR (OI)", f"{pcr(df):.2f}" if pd.notna(pcr(df)) else "-")
 
-    def generate_signal(self, df, spot_price):
-        """
-        Analyzes Greeks, IV, OI, and Price to determine direction, support, and resistance.
-        """
-        if df is None or df.empty:
-            return
+    # Bias
+    summary = buildup_summary(df, spot, band=band)
+    bcol1, bcol2, bcol3 = st.columns([1, 1, 2])
+    bcol1.metric("Bias", summary["bias"])
+    bcol2.metric("Score", f"{summary['score']:.2f}" if pd.notna(summary["score"]) else "-")
+    bcol3.write({
+        "net_oi_change_put_minus_call": summary["net_oi_change_put_minus_call"],
+        "net_volume_put_minus_call": summary["net_volume_put_minus_call"],
+        "iv_skew_put_minus_call": summary["iv_skew_put_minus_call"],
+    })
 
-        # 1. Macro Analysis (PCR)
-        total_ce_oi = df['ce_oi'].sum()
-        total_pe_oi = df['pe_oi'].sum()
-        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
+    st.divider()
 
-        # 2. Key Levels (Support & Resistance)
-        # Resistance = Strike with Max Call OI
-        res_row = df.loc[df['ce_oi'].idxmax()]
-        resistance = res_row['strike_price']
-        
-        # Support = Strike with Max Put OI
-        sup_row = df.loc[df['pe_oi'].idxmax()]
-        support = res_row['strike_price']
+    # Charts
+    left, right = st.columns(2)
 
-        # 3. Trend Decider (ATM Analysis)
-        # Find the ATM strike (closest to spot)
-        atm_row = df.iloc[(df['strike_price'] - spot_price).abs().argsort()[:1]].iloc[0]
-        
-        bias = "NEUTRAL"
-        reason = []
+    # OI walls chart
+    chart_df = df.copy()
+    chart_df["distance"] = chart_df["strike"] - spot
+    chart_df = chart_df[(chart_df["distance"] >= -band) & (chart_df["distance"] <= band)]
 
-        # PCR Logic
-        if pcr > 1.2:
-            reason.append("High PCR (Bullish Sentiment)")
-        elif pcr < 0.7:
-            reason.append("Low PCR (Bearish Sentiment)")
+    oi_plot = chart_df.melt(
+        id_vars=["strike"],
+        value_vars=["ce_oi", "pe_oi"],
+        var_name="side",
+        value_name="oi",
+    )
+    fig_oi = px.bar(oi_plot, x="strike", y="oi", color="side", barmode="group",
+                    title=f"OI around ATM (±{band}) | ATM≈{atm}")
+    left.plotly_chart(fig_oi, use_container_width=True)
 
-        # ATM Buildup Logic
-        if atm_row['ce_oi_change'] > 0 and atm_row['pe_oi_change'] < 0:
-            bias = "BEARISH"
-            reason.append("Call Writing at ATM (Resistance Building)")
-        elif atm_row['pe_oi_change'] > 0 and atm_row['ce_oi_change'] < 0:
-            bias = "BULLISH"
-            reason.append("Put Writing at ATM (Support Building)")
-        elif atm_row['ce_oi_change'] > 0 and atm_row['pe_oi_change'] > 0:
-            bias = "SIDEWAYS / VOLATILE"
-            reason.append("Both Sides Adding Positions (Straddle/Strangle Buildup)")
+    # ΔOI chart
+    doi_plot = chart_df.melt(
+        id_vars=["strike"],
+        value_vars=["ce_oi_chg", "pe_oi_chg"],
+        var_name="side",
+        value_name="oi_change",
+    )
+    fig_doi = px.bar(doi_plot, x="strike", y="oi_change", color="side", barmode="group",
+                     title="Change in OI (ΔOI) around ATM")
+    right.plotly_chart(fig_doi, use_container_width=True)
 
-        # 4. IV Check
-        avg_iv = (atm_row['ce_iv'] + atm_row['pe_iv']) / 2
-        iv_status = "High" if avg_iv > 20 else "Normal"
+    st.divider()
 
-        # --- OUTPUT REPORT ---
-        print("\n" + "="*50)
-        print(f" MARKET SNAPSHOT (Spot: {spot_price})")
-        print("="*50)
-        print(f"Detected Trend:   {bias}")
-        print(f"Reasoning:        {', '.join(reason)}")
-        print(f"PCR:              {pcr}")
-        print(f"Avg ATM IV:       {avg_iv:.2f}% ({iv_status})")
-        print("-" * 50)
-        print(f"Immediate Support:    {support} (Max Put OI: {int(sup_row['pe_oi'])})")
-        print(f"Immediate Resistance: {resistance} (Max Call OI: {int(res_row['ce_oi'])})")
-        print("-" * 50)
-        print(f"ATM Strike ({atm_row['strike_price']}) Activity:")
-        print(f"  Call OI Chg: {int(atm_row['ce_oi_change'])}")
-        print(f"  Put OI Chg:  {int(atm_row['pe_oi_change'])}")
-        print("="*50)
+    # Support/Resistance tables
+    walls = oi_walls(df, spot, top_n=top_n)
+    t1, t2, t3, t4 = st.columns(4)
+    t1.subheader("🟢 Support (Put OI)")
+    t1.dataframe(walls["support_by_oi"], use_container_width=True, hide_index=True)
+    t2.subheader("🔴 Resistance (Call OI)")
+    t2.dataframe(walls["resistance_by_oi"], use_container_width=True, hide_index=True)
+    t3.subheader("🟢 Support (Put ΔOI)")
+    t3.dataframe(walls["support_by_oi_change"], use_container_width=True, hide_index=True)
+    t4.subheader("🔴 Resistance (Call ΔOI)")
+    t4.dataframe(walls["resistance_by_oi_change"], use_container_width=True, hide_index=True)
 
-# ==========================================
-# EXECUTION
-# ==========================================
-if __name__ == "__main__":
-    tool = DhanOptionAnalyzer()
-    
-    # Configuration
-    # Note: Update expiry to a valid future date if fetching live
-    EXPIRY_DATE = "2026-01-13" 
-    
-    print(f"Fetching NIFTY Option Chain for Expiry: {EXPIRY_DATE}...")
-    raw_json = tool.fetch_option_chain(underlying_scrip=13, expiry=EXPIRY_DATE)
-    
-    if raw_json:
-        df, spot = tool.process_data(raw_json)
-        tool.generate_signal(df, spot)
+    st.divider()
+
+    # Full chain viewer
+    st.subheader("Option Chain (flattened)")
+    st.dataframe(df, use_container_width=True, height=420)
+
+with placeholder.container():
+    render()
+
+if auto:
+    while True:
+        time.sleep(refresh)
+        with placeholder.container():
+            render()
