@@ -1,6 +1,6 @@
 streamlit
-plotly
+requests
 pandas
-dhanhq
-pandas_ta
-toml
+numpy
+plotly
+python-dotenv
