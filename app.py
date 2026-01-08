@@ -27,7 +27,7 @@ WATCHLIST_PATH = APP_DIR / "stock_watchlist.csv"
 @st.cache_data(show_spinner=False)
 def load_watchlist(csv_path: pathlib.Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # expected columns from your file:
+    # expected columns:
     # SEM_TRADING_SYMBOL, SEM_SMST_SECURITY_ID, SEM_INSTRUMENT_NAME
     df["SEM_TRADING_SYMBOL"] = df["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.strip()
     df["SEM_INSTRUMENT_NAME"] = df["SEM_INSTRUMENT_NAME"].astype(str).str.strip()
@@ -44,7 +44,6 @@ watch_df = load_watchlist(WATCHLIST_PATH)
 
 # Sidebar list: top 2 fixed, rest from file
 fno_symbols = watch_df["SEM_TRADING_SYMBOL"].tolist()
-# remove duplicates if file accidentally contains NIFTY/SENSEX
 fno_symbols = [s for s in fno_symbols if s not in {"NIFTY", "SENSEX"}]
 sidebar_list = ["NIFTY", "SENSEX"] + fno_symbols
 
@@ -56,7 +55,17 @@ with st.sidebar:
     selected = st.selectbox("Select Instrument", sidebar_list, index=0)
 
     refresh = st.slider("Refresh (seconds)", 3, 30, 5)
-    band = st.slider("Analysis range (points)", 300, 2000, 800, 50)
+
+    # ✅ Percent-based analysis range
+    band_pct = st.slider(
+        "Analysis range (%)",
+        min_value=1.0,
+        max_value=10.0,
+        value=3.0,
+        step=0.5,
+        help="Window around spot used for option-chain analysis"
+    )
+
     auto = st.toggle("Auto refresh", True)
 
     st.divider()
@@ -111,10 +120,18 @@ df, spot, meta = load_chain(under)
 step = 50 if meta["trading_symbol"] in {"NIFTY"} else (100 if meta["trading_symbol"] in {"SENSEX"} else 10)
 atm = atm_strike(spot, step)
 
-zones_now = support_resistance_zones(df, spot, band=band)
+# ✅ Percent → points + adaptive minimum (±6 strikes)
+band_points = int(round(spot * band_pct / 100.0)) if pd.notna(spot) else 0
+band_points = max(band_points, 6 * step)  # adaptive minimum window
+st.caption(f"Analysis window: ±{band_pct:.1f}%  (≈ ±{band_points} points)")
+
+zones_now = support_resistance_zones(df, spot, band=band_points)
 support_now = zones_now["support"]
 res_now = zones_now["resistance"]
-bias = buildup_summary(df, spot, band=min(500, band))
+
+# Bias window should be tighter than full analysis window (use min(2% of spot, band_points))
+bias_band = int(min(round(spot * 0.02), band_points)) if pd.notna(spot) else 0
+bias = buildup_summary(df, spot, band=bias_band)
 
 # -----------------------------
 # Snapshot handling (session-only)
@@ -209,7 +226,8 @@ st.divider()
 # OI chart (Calls=Red, Puts=Green)
 # -----------------------------
 st.subheader("📈 Open Interest around Spot")
-win = df[(df["strike"] >= spot - band) & (df["strike"] <= spot + band)].copy()
+
+win = df[(df["strike"] >= spot - band_points) & (df["strike"] <= spot + band_points)].copy()
 
 plot_df = win.melt(
     id_vars="strike",
@@ -229,4 +247,3 @@ fig = px.bar(
     color_discrete_map={"CALL OI": "red", "PUT OI": "green"},
 )
 st.plotly_chart(fig, use_container_width=True, key=f"oi_{meta['trading_symbol']}")
-
