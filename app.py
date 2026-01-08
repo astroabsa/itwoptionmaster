@@ -94,7 +94,7 @@ if index_choice == "NIFTY 50":
     spot_default = 25900 # Based on your screenshot
     target_day = 1 # Tuesday
 elif index_choice == "SENSEX":
-    sec_id = "51005"
+    sec_id = "51"
     segment = "IDX_I" # Indices are ALWAYS 'IDX_I'
     spot_default = 84000
     target_day = 3 # Thursday
