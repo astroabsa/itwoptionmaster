@@ -264,6 +264,18 @@ st.divider()
 
 
 # -----------------------------
+# Breakout / Breakdown probability
+# -----------------------------
+st.subheader("📊 Breakout / Breakdown Probability (heuristic)")
+p1, p2, p3 = st.columns(3)
+p1.metric("Breakout", f"{probs['breakout']*100:.0f}%")
+p2.metric("Breakdown", f"{probs['breakdown']*100:.0f}%")
+p3.metric("Range", f"{probs['range']*100:.0f}%")
+st.caption("Heuristic probabilities reflect wall strength + distance + bias (not guaranteed).")
+st.divider()
+
+
+# -----------------------------
 # Final conclusion
 # -----------------------------
 st.subheader("📌 Final Conclusion (Nearest Expiry)")
@@ -282,18 +294,6 @@ else:
     right.warning("Resistance: Not clear")
 
 st.caption(f"Bias: **{bias['bias']}** (score {bias['score']:.2f})")
-st.divider()
-
-
-# -----------------------------
-# Breakout / Breakdown probability
-# -----------------------------
-st.subheader("📊 Breakout / Breakdown Probability (heuristic)")
-p1, p2, p3 = st.columns(3)
-p1.metric("Breakout", f"{probs['breakout']*100:.0f}%")
-p2.metric("Breakdown", f"{probs['breakdown']*100:.0f}%")
-p3.metric("Range", f"{probs['range']*100:.0f}%")
-st.caption("Heuristic probabilities reflect wall strength + distance + bias (not guaranteed).")
 st.divider()
 
 
