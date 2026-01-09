@@ -341,6 +341,34 @@ st.divider()
 
 
 # -----------------------------
+# OI chart (Calls=Red, Puts=Green)
+# -----------------------------
+st.subheader("📈 Open Interest around Spot")
+win = df[(df["strike"] >= spot - band_points) & (df["strike"] <= spot + band_points)].copy()
+
+plot_df = win.melt(
+    id_vars="strike",
+    value_vars=["ce_oi", "pe_oi"],
+    var_name="Side",
+    value_name="OI"
+)
+plot_df["Side"] = plot_df["Side"].replace({"ce_oi": "CALL OI", "pe_oi": "PUT OI"})
+
+fig = px.bar(
+    plot_df,
+    x="strike",
+    y="OI",
+    color="Side",
+    barmode="group",
+    title="Open Interest around Spot",
+    color_discrete_map={"CALL OI": "red", "PUT OI": "green"},
+)
+st.plotly_chart(fig, use_container_width=True, key=f"oi_{meta['trading_symbol']}")
+
+st.divider()
+
+
+# -----------------------------
 # Wall Shift (arrows + color coding) vs previous 15-min bucket
 # -----------------------------
 st.subheader("🔁 Wall Shift vs Previous 15-min Snapshot")
@@ -430,35 +458,6 @@ else:
         st.warning(e)
 
 st.divider()
-
-
-# -----------------------------
-# OI chart (Calls=Red, Puts=Green)
-# -----------------------------
-st.subheader("📈 Open Interest around Spot")
-win = df[(df["strike"] >= spot - band_points) & (df["strike"] <= spot + band_points)].copy()
-
-plot_df = win.melt(
-    id_vars="strike",
-    value_vars=["ce_oi", "pe_oi"],
-    var_name="Side",
-    value_name="OI"
-)
-plot_df["Side"] = plot_df["Side"].replace({"ce_oi": "CALL OI", "pe_oi": "PUT OI"})
-
-fig = px.bar(
-    plot_df,
-    x="strike",
-    y="OI",
-    color="Side",
-    barmode="group",
-    title="Open Interest around Spot",
-    color_discrete_map={"CALL OI": "red", "PUT OI": "green"},
-)
-st.plotly_chart(fig, use_container_width=True, key=f"oi_{meta['trading_symbol']}")
-
-st.divider()
-
 
 # -----------------------------
 # History charts
