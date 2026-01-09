@@ -276,7 +276,7 @@ st.divider()
 
 
 # -----------------------------
-# Final conclusion
+# S/R Zones
 # -----------------------------
 st.subheader("📌 S/R Zones (Nearest Expiry)")
 left, right = st.columns(2)
@@ -300,7 +300,7 @@ st.divider()
 # -----------------------------
 # Buy-only recommendation (no selling)
 # -----------------------------
-st.subheader("🧠 Buy-only Idea (rule-based)")
+st.subheader("🧠 Trade Idea (Educational)")
 rec = option_buy_recommendation(
     df=df,
     spot=spot,
