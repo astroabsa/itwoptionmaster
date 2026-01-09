@@ -278,7 +278,7 @@ st.divider()
 # -----------------------------
 # Final conclusion
 # -----------------------------
-st.subheader("📌 Final Conclusion (Nearest Expiry)")
+st.subheader("📌 S/R Zones (Nearest Expiry)")
 left, right = st.columns(2)
 
 if support_now:
